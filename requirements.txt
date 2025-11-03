@@ -1,0 +1,4 @@
+streamlit>=1.36.0
+ib_insync>=0.9.86
+pandas>=2.2.0
+python-dotenv>=1.0.1
