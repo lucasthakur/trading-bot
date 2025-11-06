@@ -36,7 +36,7 @@ Create a `.env` file in the project root (same folder as `app.py`):
 ```
 IB_HOST=127.0.0.1
 IB_PORT=7497
-IB_CLIENT_ID=19
+IB_CLIENT_ID=1001
 ```
 
 Defaults are used if variables are missing: host `127.0.0.1`, port `7497` (paper), clientId `19`.
@@ -75,4 +75,3 @@ streamlit run app.py
 
 - The app uses ib_insync's async event loop under the hood, but Streamlit pages rerun per interaction. Long-running background tasks are avoided; order placement and updates are handled via ib_insync events and quick API calls.
 - If you restart TWS/Gateway, reconnect from the app.
-

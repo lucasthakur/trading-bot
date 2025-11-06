@@ -2,13 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Literal, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+
+
+def ensure_thread_event_loop() -> None:
+    """Ensure the Streamlit script thread has an asyncio event loop."""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+ensure_thread_event_loop()
 from ib_insync import IB, Contract, ContractDetails, Future, Order, Trade, Ticker, util
 
 
@@ -58,6 +70,9 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("last_order_ids", ())  # tuple[int, int, int]
     st.session_state.setdefault("children_adjusted", False)
     st.session_state.setdefault("live_confirmed", False)
+    st.session_state.setdefault("order_qty", 1)
+    st.session_state.setdefault("ticker_subscription", None)
+    st.session_state.setdefault("ticker_listener", None)
 
 
 # --- IB helpers ---
@@ -69,13 +84,15 @@ def get_front_month_mes(ib: IB) -> Future:
     details: list[ContractDetails] = ib.reqContractDetails(
         Future(symbol="MES", exchange="CME", currency="USD")
     )
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     def parse_month(s: str) -> datetime:
         # IB may return YYYYMM or YYYYMMDD; normalize to YYYYMM01 if only month.
         if len(s) == 6:
-            return datetime.strptime(s + "01", "%Y%m%d")
-        return datetime.strptime(s, "%Y%m%d")
+            dt = datetime.strptime(s + "01", "%Y%m%d")
+        else:
+            dt = datetime.strptime(s, "%Y%m%d")
+        return dt.replace(tzinfo=timezone.utc)
 
     future_details = [
         (cd, parse_month(cd.contract.lastTradeDateOrContractMonth)) for cd in details
@@ -108,14 +125,55 @@ def _market_price_from_ticker(t: Ticker) -> Optional[float]:
 
 def refresh_last_price(ib: IB, contract: Contract) -> Optional[float]:
     try:
-        tickers = ib.reqTickers(contract)
+        if hasattr(ib, "loop") and hasattr(ib, "reqTickersAsync"):
+            future = asyncio.run_coroutine_threadsafe(ib.reqTickersAsync(contract), ib.loop)
+            tickers = future.result(timeout=2.0)
+        else:
+            tickers = ib.reqTickers(contract)
         if tickers:
             price = _market_price_from_ticker(tickers[0])
             st.session_state.last_price = price
             return price
+    except FuturesTimeoutError:
+        log("Market data request timed out; using last known price.")
     except Exception as e:  # noqa: BLE001
         log(f"Market data error: {e}")
     return st.session_state.last_price
+
+
+def _stop_market_data_stream(ib: IB) -> None:
+    ticker = st.session_state.get("ticker_subscription")
+    listener = st.session_state.get("ticker_listener")
+    if ticker is not None:
+        try:
+            if listener:
+                ticker.updateEvent -= listener
+        except Exception:
+            pass
+        try:
+            ib.cancelMktData(ticker.contract)
+        except Exception:
+            pass
+    st.session_state.ticker_subscription = None
+    st.session_state.ticker_listener = None
+
+
+def _start_market_data_stream(ib: IB, contract: Contract) -> None:
+    _stop_market_data_stream(ib)
+    try:
+        ticker = ib.reqMktData(contract, "", False, False)
+    except Exception as e:  # noqa: BLE001
+        log(f"Market data subscription error: {e}")
+        return
+
+    def on_ticker_update(_: Ticker) -> None:
+        price = _market_price_from_ticker(ticker)
+        if price:
+            st.session_state.last_price = price
+
+    ticker.updateEvent += on_ticker_update
+    st.session_state.ticker_subscription = ticker
+    st.session_state.ticker_listener = on_ticker_update
 
 
 def build_bracket(
@@ -253,12 +311,12 @@ def place_bracket_trade(
         except Exception as e:  # noqa: BLE001
             log(f"Fill handler error: {e}")
 
-    parent_trade.fillEvent += on_fill
-    tp_trade.fillEvent += on_fill
-    sl_trade.fillEvent += on_fill
+    for trade in (parent_trade, tp_trade, sl_trade):
+        if hasattr(trade, "fillEvent"):
+            trade.fillEvent += on_fill
 
     # Order status logging
-    def on_update(tr: Trade):
+    def on_status(tr: Trade):
         try:
             os = tr.orderStatus
             if os is not None:
@@ -271,9 +329,9 @@ def place_bracket_trade(
         except Exception as e:  # noqa: BLE001
             log(f"Status handler error: {e}")
 
-    parent_trade.updateEvent += on_update
-    tp_trade.updateEvent += on_update
-    sl_trade.updateEvent += on_update
+    for trade in (parent_trade, tp_trade, sl_trade):
+        if hasattr(trade, "statusEvent"):
+            trade.statusEvent += on_status
 
     # Adjust children around actual fill price (once) if needed
     def adjust_children_on_parent_first_fill(trade: Trade, fill):
@@ -391,6 +449,7 @@ def render_connection_panel() -> None:
                         contract = get_front_month_mes(ib)
                         st.session_state.current_contract = contract
                         st.session_state.contract_month_str = contract.lastTradeDateOrContractMonth
+                        _start_market_data_stream(ib, contract)
                         refresh_last_price(ib, contract)
                         log(
                             f"Connected. Selected contract: MES {st.session_state.contract_month_str} CME USD (conId={contract.conId})"
@@ -404,6 +463,7 @@ def render_connection_panel() -> None:
     with c2:
         if st.session_state.connected and st.button("Disconnect"):
             try:
+                _stop_market_data_stream(st.session_state.ib)
                 st.session_state.ib.disconnect()
             finally:
                 st.session_state.connected = False
@@ -422,10 +482,15 @@ def render_order_panel() -> None:
             f"Instrument: MES {st.session_state.contract_month_str} CME USD"
         )
     if st.session_state.connected and st.session_state.current_contract:
-        # Update and show last price
-        price = refresh_last_price(st.session_state.ib, st.session_state.current_contract)
+        price = st.session_state.get("last_price")
         if price:
             st.caption(f"Last price: {price:.5f}")
+        else:
+            st.caption("Last price: waiting for market data…")
+            if st.button("Request Price Snapshot"):
+                fresh = refresh_last_price(st.session_state.ib, st.session_state.current_contract)
+                if fresh:
+                    st.success(f"Snapshot price: {fresh:.5f}")
 
     # Inputs
     entry_price_input = st.text_input("Price (optional)", value="", placeholder="Leave blank for market")
@@ -442,8 +507,14 @@ def render_order_panel() -> None:
             st.error("Invalid price. Use a numeric value.")
             entry_price = None
 
-    qty = 1
-    st.text_input("Quantity", value=str(qty), disabled=True)
+    qty = int(
+        st.number_input(
+            "Quantity",
+            min_value=1,
+            step=1,
+            key="order_qty",
+        )
+    )
 
     tif = st.radio("TIF", ("DAY", "GTC"), index=0, horizontal=True)
 
@@ -483,6 +554,11 @@ def render_order_panel() -> None:
             "tp": tp_p,
             "sl": sl_p,
         }
+        log(
+            f"Order intent captured: {side} {entry_type}"
+            + (f" @ {entry_price:.5f}" if entry_price is not None else "")
+            + f", qty={qty}, tif={tif}"
+        )
 
     if st.session_state.pending_order is not None:
         po = st.session_state.pending_order
@@ -505,6 +581,14 @@ def render_order_panel() -> None:
                 try:
                     st.session_state.submitting = True
                     st.session_state.children_adjusted = False
+                    contract_label = (
+                        f"MES {st.session_state.contract_month_str}"
+                        if st.session_state.contract_month_str
+                        else "Unknown contract"
+                    )
+                    log(
+                        f"Submitting {po['side']} {po['entry_type']} order qty={po['qty']} tif={po['tif']} on {contract_label}"
+                    )
                     placed = place_bracket_trade(
                         st.session_state.ib,
                         st.session_state.current_contract,
@@ -517,6 +601,7 @@ def render_order_panel() -> None:
                     st.success(
                         f"Submitted. Parent/TP/SL IDs: {st.session_state.last_order_ids}"
                     )
+                    log(f"Order submission complete: ids={st.session_state.last_order_ids}")
                 except Exception as e:  # noqa: BLE001
                     st.error(f"Submit error: {e}")
                     log(f"Submit error: {e}")
