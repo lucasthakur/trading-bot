@@ -5,6 +5,7 @@ import logging
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Literal, Optional, Tuple
 
 import pandas as pd
@@ -73,11 +74,14 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("order_qty", 1)
     st.session_state.setdefault("ticker_subscription", None)
     st.session_state.setdefault("ticker_listener", None)
+    st.session_state.setdefault("min_tick", 0.25)
+    st.session_state.setdefault("tp_ticks", 2)  # reward multiple (ticks)
+    st.session_state.setdefault("sl_ticks", 1)  # risk multiple (ticks)
 
 
 # --- IB helpers ---
-def get_front_month_mes(ib: IB) -> Future:
-    """Return nearest non-expired MES contract as a fully qualified Future.
+def get_front_month_mes(ib: IB) -> Tuple[Future, float]:
+    """Return nearest non-expired MES contract and its min tick.
 
     Picks the earliest lastTradeDateOrContractMonth strictly in the future.
     """
@@ -112,7 +116,8 @@ def get_front_month_mes(ib: IB) -> Future:
         currency="USD",
     )
     qualified = ib.qualifyContracts(picked)[0]
-    return qualified
+    min_tick = best_cd.minTick if getattr(best_cd, "minTick", None) else 0.25
+    return qualified, float(min_tick)
 
 
 def _market_price_from_ticker(t: Ticker) -> Optional[float]:
@@ -139,6 +144,24 @@ def refresh_last_price(ib: IB, contract: Contract) -> Optional[float]:
     except Exception as e:  # noqa: BLE001
         log(f"Market data error: {e}")
     return st.session_state.last_price
+
+
+def get_tick_size() -> float:
+    tick = st.session_state.get("min_tick", 0.25)
+    if not tick or tick <= 0:
+        tick = 0.25
+    return float(tick)
+
+
+def round_to_tick(value: Optional[float], tick: Optional[float] = None) -> Optional[float]:
+    if value is None:
+        return None
+    t = tick if tick and tick > 0 else get_tick_size()
+    dec_value = Decimal(str(value))
+    dec_tick = Decimal(str(t))
+    scaled = dec_value / dec_tick
+    rounded_units = scaled.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(rounded_units * dec_tick)
 
 
 def _stop_market_data_stream(ib: IB) -> None:
@@ -196,19 +219,22 @@ def build_bracket(
     assert qty > 0
     assert tif in ("DAY", "GTC")
 
+    tick = get_tick_size()
+    tp_ticks = max(1, int(st.session_state.get("tp_ticks", 2)))
+    sl_ticks = max(1, int(st.session_state.get("sl_ticks", 1)))
     base_price: Optional[float]
     if entry_type == "LMT" and entry_price is not None:
-        base_price = float(entry_price)
+        base_price = round_to_tick(float(entry_price), tick)
     else:
-        base_price = st.session_state.get("last_price")
+        base_price = round_to_tick(st.session_state.get("last_price"), tick)
 
     parent = Order()
     parent.action = parent_action
     parent.totalQuantity = qty
     parent.tif = tif
     parent.orderType = "MKT" if entry_type == "MKT" else "LMT"
-    if parent.orderType == "LMT":
-        parent.lmtPrice = float(entry_price)  # validated upstream
+    if parent.orderType == "LMT" and entry_price is not None:
+        parent.lmtPrice = round_to_tick(float(entry_price), tick)
     parent.transmit = False
 
     # Child orders
@@ -219,8 +245,8 @@ def build_bracket(
         tp.action = "SELL"
         sl.action = "SELL"
         if base_price is not None:
-            tp_price = base_price + reward
-            sl_price = base_price - risk
+            tp_price = round_to_tick(base_price + (tp_ticks * tick), tick)
+            sl_price = round_to_tick(base_price - (sl_ticks * tick), tick)
         else:
             tp_price = None  # will be set on fill adjustment
             sl_price = None
@@ -228,8 +254,8 @@ def build_bracket(
         tp.action = "BUY"
         sl.action = "BUY"
         if base_price is not None:
-            tp_price = base_price - reward
-            sl_price = base_price + risk
+            tp_price = round_to_tick(base_price - (tp_ticks * tick), tick)
+            sl_price = round_to_tick(base_price + (sl_ticks * tick), tick)
         else:
             tp_price = None
             sl_price = None
@@ -342,6 +368,7 @@ def place_bracket_trade(
             if not avg or avg <= 0:
                 return
 
+            tick = get_tick_size()
             # If LMT and avg equals limit within epsilon, keep as-is
             if parent.orderType == "LMT" and parent.lmtPrice:
                 if abs(float(parent.lmtPrice) - float(avg)) < 1e-6:
@@ -356,14 +383,16 @@ def place_bracket_trade(
                 pass
 
             # Rebuild children around actual avg fill price
+            tp_ticks = max(1, int(st.session_state.get("tp_ticks", 2)))
+            sl_ticks = max(1, int(st.session_state.get("sl_ticks", 1)))
             if side == "BUY":
-                new_tp_price = float(avg) + REWARD_OFFSET
-                new_sl_price = float(avg) - RISK_OFFSET
+                new_tp_price = round_to_tick(float(avg) + (tp_ticks * tick), tick)
+                new_sl_price = round_to_tick(float(avg) - (sl_ticks * tick), tick)
                 new_tp_action = "SELL"
                 new_sl_action = "SELL"
             else:
-                new_tp_price = float(avg) - REWARD_OFFSET
-                new_sl_price = float(avg) + RISK_OFFSET
+                new_tp_price = round_to_tick(float(avg) - (tp_ticks * tick), tick)
+                new_sl_price = round_to_tick(float(avg) + (sl_ticks * tick), tick)
                 new_tp_action = "BUY"
                 new_sl_action = "BUY"
 
@@ -396,7 +425,16 @@ def place_bracket_trade(
         except Exception as e:  # noqa: BLE001
             log(f"Adjustment error: {e}")
 
-    parent_trade.fillEvent += adjust_children_on_parent_first_fill
+    def adjust_children_on_parent_fill(*args):
+        trade = args[0] if args else None
+        fill = args[1] if len(args) > 1 else None
+        if not isinstance(trade, Trade):
+            return
+        adjust_children_on_parent_first_fill(trade, fill)
+
+    parent_trade.fillEvent += adjust_children_on_parent_fill
+    parent_trade.filledEvent += adjust_children_on_parent_fill
+    parent_trade.statusEvent += adjust_children_on_parent_fill
 
     return PlacedBracket(parent_trade, tp_trade, sl_trade)
 
@@ -446,9 +484,10 @@ def render_connection_panel() -> None:
                     st.session_state.children_adjusted = False
                     if st.session_state.connected:
                         # Resolve front month and subscribe to quotes
-                        contract = get_front_month_mes(ib)
+                        contract, min_tick = get_front_month_mes(ib)
                         st.session_state.current_contract = contract
                         st.session_state.contract_month_str = contract.lastTradeDateOrContractMonth
+                        st.session_state.min_tick = float(min_tick)
                         _start_market_data_stream(ib, contract)
                         refresh_last_price(ib, contract)
                         log(
@@ -507,15 +546,36 @@ def render_order_panel() -> None:
             st.error("Invalid price. Use a numeric value.")
             entry_price = None
 
-    qty = int(
-        st.number_input(
+    cqty, ctp, csl = st.columns(3)
+    with cqty:
+        qty_input = st.number_input(
             "Quantity",
             min_value=1,
             step=1,
             key="order_qty",
         )
-    )
+    with ctp:
+        st.session_state.tp_ticks = int(
+            st.number_input(
+                "TP ticks",
+                min_value=1,
+                value=int(st.session_state.get("tp_ticks", 2)),
+                step=1,
+                help="Number of ticks from entry for take profit",
+            )
+        )
+    with csl:
+        st.session_state.sl_ticks = int(
+            st.number_input(
+                "SL ticks",
+                min_value=1,
+                value=int(st.session_state.get("sl_ticks", 1)),
+                step=1,
+                help="Number of ticks from entry for stop loss",
+            )
+        )
 
+    qty = int(qty_input)
     tif = st.radio("TIF", ("DAY", "GTC"), index=0, horizontal=True)
 
     colb, cols = st.columns(2)
@@ -531,24 +591,30 @@ def render_order_panel() -> None:
     if buy_clicked or sell_clicked:
         if entry_price_input.strip() and entry_price is None:
             return  # invalid price
+        tick = get_tick_size()
         side = "BUY" if buy_clicked else "SELL"
         entry_type: Literal["MKT", "LMT"] = "LMT" if entry_price is not None else "MKT"
 
         # Preview prices based on current info
-        base = entry_price if entry_type == "LMT" else st.session_state.get("last_price")
+        if entry_type == "LMT" and entry_price is not None:
+            base = round_to_tick(entry_price, tick)
+        else:
+            base = round_to_tick(st.session_state.get("last_price"), tick)
         if base is None:
             st.warning("No market price available yet; children will be adjusted on fill.")
+        tp_ticks = max(1, int(st.session_state.get("tp_ticks", 2)))
+        sl_ticks = max(1, int(st.session_state.get("sl_ticks", 1)))
         if side == "BUY":
-            tp_p = (base + REWARD_OFFSET) if base is not None else None
-            sl_p = (base - RISK_OFFSET) if base is not None else None
+            tp_p = round_to_tick(base + (tp_ticks * tick), tick) if base is not None else None
+            sl_p = round_to_tick(base - (sl_ticks * tick), tick) if base is not None else None
         else:
-            tp_p = (base - REWARD_OFFSET) if base is not None else None
-            sl_p = (base + RISK_OFFSET) if base is not None else None
+            tp_p = round_to_tick(base - (tp_ticks * tick), tick) if base is not None else None
+            sl_p = round_to_tick(base + (sl_ticks * tick), tick) if base is not None else None
 
         st.session_state.pending_order = {
             "side": side,
             "entry_type": entry_type,
-            "entry_price": entry_price,
+            "entry_price": round_to_tick(entry_price, tick) if entry_price is not None else None,
             "qty": qty,
             "tif": tif,
             "tp": tp_p,
@@ -589,7 +655,7 @@ def render_order_panel() -> None:
                     log(
                         f"Submitting {po['side']} {po['entry_type']} order qty={po['qty']} tif={po['tif']} on {contract_label}"
                     )
-                    placed = place_bracket_trade(
+                    place_bracket_trade(
                         st.session_state.ib,
                         st.session_state.current_contract,
                         po["side"],
